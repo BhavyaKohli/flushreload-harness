@@ -11,7 +11,6 @@ script exit, after newspy finishes.
 
 import argparse
 import csv
-import json
 import re
 import subprocess
 import sys
@@ -28,7 +27,7 @@ CALIB = f"{VM_HOME}/calibration"
 
 DEFAULT_LEVELS = list(range(0, 100, 10))
 DEFAULT_REPS = 3
-CALIB_RUNS = 1
+CALIB_RUNS = 10
 WARMUP_S = 2
 LOAD_MEAS_S = 3
 NEWSPY_TIMEOUT_S = 300
@@ -41,6 +40,7 @@ OUT_DIR = ROOT / "results"
 
 RE_LOAD = re.compile(r"^LOAD_MEASURED\s+([\d.]+)\s*$", re.M)
 RE_THRESH = re.compile(r"^THRESHOLD\s+(\d+)\s*$", re.M)
+RE_THRESH_USED = re.compile(r"^THRESH_USED\s+(\d+)\s*$", re.M)
 RE_ACTUAL = re.compile(r"^Actual key:[ \t]+([0-9a-f ]+)$", re.M)
 RE_RECOV = re.compile(r"^Recovered key:[ \t]+([0-9a-f ]+)$", re.M)
 
@@ -81,6 +81,14 @@ def parse_thresholds(stdout: str) -> list[int]:
     return [int(x) for x in RE_THRESH.findall(stdout)]
 
 
+def parse_thresh_used(stdout: str) -> int:
+    """Extract the exact threshold actually passed to newspy."""
+    m = RE_THRESH_USED.search(stdout)
+    if not m:
+        raise ValueError(f"THRESH_USED missing from:\n{stdout}")
+    return int(m.group(1))
+
+
 def parse_newspy_keys(stdout: str) -> tuple[bytes, bytes]:
     """Extract (actual, recovered) 16-byte keys from newspy output."""
     ma, mr = RE_ACTUAL.search(stdout), RE_RECOV.search(stdout)
@@ -100,9 +108,10 @@ def byte_accuracy(actual: bytes, recovered: bytes) -> tuple[float, bool]:
 
 
 def _calib_emit_block(n_runs: int) -> str:
+    """Emit bash that runs calibration n_runs times and echoes each threshold."""
     return (
         f"for i in $(seq 1 {n_runs}); do\n"
-        f"  V=$(taskset -c {SPY_CPU} {CALIB} | "
+        f"  V=$(timeout {CALIB_TIMEOUT_S} taskset -c {SPY_CPU} {CALIB} | "
         "awk -F': ' '/Suggested cache hit/ {print $NF}')\n"
         f'  if [ -z "$V" ]; then echo CALIB_PARSE_ERROR; exit 2; fi\n'
         f'  echo "THRESHOLD $V"\n'
@@ -110,30 +119,26 @@ def _calib_emit_block(n_runs: int) -> str:
     )
 
 
-def build_run_script(
-    level: int, mode: str, exp: int, T0: int, victim_defense: bool = False,
-) -> str:
+def build_run_script(level: int, mode: str, exp: int, T0: int) -> str:
     """Build the remote bash script for one (level, rep) point.
 
     :param level: Target loader duty cycle (%).
     :param mode: Loader mode: 'mem', 'busy', 'target', or 'evict'.
     :param exp: 1 (use T0) or 2 (recalibrate).
     :param T0: Fixed threshold for exp1; ignored for exp2.
-    :param victim_defense: Enable cache-state equalization in newspy.
     :return: Bash script text.
     """
-    defense_arg = " -d" if victim_defense else ""
     if exp == 2:
         thresh_block = (
             f"SUM=0; N=0\n"
             + f"for i in $(seq 1 {CALIB_RUNS}); do\n"
-            + f"  V=$(taskset -c {SPY_CPU} {CALIB} | "
+            + f"  V=$(timeout {CALIB_TIMEOUT_S} taskset -c {SPY_CPU} {CALIB} | "
             + "awk -F': ' '/Suggested cache hit/ {print $NF}')\n"
             + '  if [ -z "$V" ]; then echo CALIB_PARSE_ERROR; exit 2; fi\n'
             + '  echo "THRESHOLD $V"\n'
             + "  SUM=$(( SUM + V )); N=$(( N + 1 ))\n"
             + "done\n"
-            + "THRESH=$(( SUM / N ))\n"
+            + "THRESH=$(( (SUM + N / 2) / N ))\n"
         )
     else:
         thresh_block = f'echo "THRESHOLD {T0}"\nTHRESH={T0}\n'
@@ -142,14 +147,14 @@ def build_run_script(
 trap 'pkill -x loadgen 2>/dev/null || true' EXIT INT TERM
 pkill -x loadgen 2>/dev/null || true
 sleep 0.2
-if [ "$(nproc)" -le {SPY_CPU} ]; then
-  echo "At least {SPY_CPU + 1} vCPUs are required" >&2
-  exit 2
-fi
 
 taskset -c {LOADER_CPU} {LOADER} {mode} {level} >/dev/null 2>&1 &
 LOADER_PID=$!
 sleep {WARMUP_S}
+if ! kill -0 $LOADER_PID 2>/dev/null; then
+  echo "LOADER_DIED" >&2
+  exit 3
+fi
 
 A=$(awk '{{print $14+$15}}' /proc/$LOADER_PID/stat)
 A_WALL=$(awk '{{print $1}}' /proc/uptime)
@@ -167,7 +172,12 @@ echo "LOAD_MEASURED $LOAD"
 {thresh_block}
 echo "THRESH_USED $THRESH"
 
-taskset -c {SPY_CPU} {NEWSPY} -c $THRESH{defense_arg}
+timeout {NEWSPY_TIMEOUT_S} taskset -c {SPY_CPU} {NEWSPY} -c $THRESH
+NEWSPY_RC=$?
+if [ $NEWSPY_RC -ne 0 ]; then
+  echo "NEWSPY_TIMEOUT_OR_ERROR rc=$NEWSPY_RC" >&2
+  exit 4
+fi
 """
 
 
@@ -177,25 +187,18 @@ def calibrate_baseline() -> tuple[int, list[int]]:
         "set -u\n"
         "pkill -x loadgen 2>/dev/null || true\n"
         "sleep 0.2\n"
-        f'if [ "$(nproc)" -le {SPY_CPU} ]; then\n'
-        f'  echo "At least {SPY_CPU + 1} vCPUs are required" >&2\n'
-        "  exit 2\n"
-        "fi\n"
         + _calib_emit_block(CALIB_RUNS)
     )
     out = ssh_bash(script, timeout_s=CALIB_TIMEOUT_S * CALIB_RUNS + 60)
     raw = parse_thresholds(out)
     if len(raw) != CALIB_RUNS:
         raise RuntimeError(f"Expected {CALIB_RUNS} thresholds, got {len(raw)}: {raw}")
-    return int(round(mean(raw))), raw
+    return int(mean(raw) + 0.5), raw
 
 
-def run_point(
-    level: int, rep: int, mode: str, exp: int, T0: int,
-    victim_defense: bool = False,
-) -> dict:
+def run_point(level: int, rep: int, mode: str, exp: int, T0: int) -> dict:
     """Execute one (level, rep) data point and return its record."""
-    script = build_run_script(level, mode, exp, T0, victim_defense)
+    script = build_run_script(level, mode, exp, T0)
     out = ssh_bash(
         script,
         timeout_s=CALIB_TIMEOUT_S * CALIB_RUNS + NEWSPY_TIMEOUT_S + 60,
@@ -207,13 +210,13 @@ def run_point(
     if exp == 2 and len(thresholds) != CALIB_RUNS:
         raise RuntimeError(f"Expected {CALIB_RUNS} thresholds, got {len(thresholds)}")
     actual, recovered = parse_newspy_keys(out)
+    thresh_used = parse_thresh_used(out)
     acc, exact = byte_accuracy(actual, recovered)
 
     rec = {
-        "level": level, "rep": rep, "load_pct": load,
+        "level": level, "mode": mode, "rep": rep, "load_pct": load,
         "accuracy": acc, "exact_match": exact,
-        "threshold_used": thresholds[0] if exp == 1 else int(round(mean(thresholds))),
-        "victim_defense": victim_defense,
+        "threshold_used": thresh_used,
         "actual_key": actual.hex(), "recovered_key": recovered.hex(),
     }
     if exp == 2:
@@ -223,10 +226,7 @@ def run_point(
     return rec
 
 
-def run_experiment(
-    exp: int, levels: list[int], reps: int, mode: str,
-    victim_defense: bool = False,
-) -> list[dict]:
+def run_experiment(exp: int, levels: list[int], reps: int, mode: str) -> list[dict]:
     """Run one experiment across levels × reps."""
     T0 = 0
     if exp == 1:
@@ -237,7 +237,7 @@ def run_experiment(
     for level in levels:
         for rep in range(reps):
             print(f"[exp{exp}] level={level:>2}% rep={rep} ... ", end="", flush=True)
-            rec = run_point(level, rep, mode, exp, T0, victim_defense)
+            rec = run_point(level, rep, mode, exp, T0)
             print(f"load={rec['load_pct']:5.1f}%  acc={rec['accuracy']:.3f}")
             records.append(rec)
     return records
@@ -247,12 +247,12 @@ def write_csv(path: Path, records: list[dict], exp: int) -> None:
     """Write records to CSV; columns depend on the experiment."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = (
-        ["level", "load_pct", "accuracy", "exact_match",
-         "threshold_used", "victim_defense", "rep", "actual_key", "recovered_key"]
+        ["level", "mode", "load_pct", "accuracy", "exact_match",
+         "threshold_used", "rep", "actual_key", "recovered_key"]
         if exp == 1 else
-        ["level", "load_pct", "accuracy", "exact_match",
-         "threshold_mean", "threshold_std", "thresholds_raw",
-         "victim_defense", "rep", "actual_key", "recovered_key"]
+        ["level", "mode", "load_pct", "accuracy", "exact_match",
+         "threshold_used", "threshold_mean", "threshold_std",
+         "thresholds_raw", "rep", "actual_key", "recovered_key"]
     )
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -264,53 +264,25 @@ def write_csv(path: Path, records: list[dict], exp: int) -> None:
             w.writerow(row)
 
 
-def append_jsonl(path: Path, record: dict) -> None:
-    """Append one record as a JSON line."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(json.dumps(record) + "\n")
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("experiment", choices=["exp1", "exp2", "both"])
     ap.add_argument("--levels", type=int, nargs="+", default=DEFAULT_LEVELS)
     ap.add_argument("--reps", type=int, default=DEFAULT_REPS)
-    ap.add_argument(
-        "--mode", choices=["mem", "busy", "target", "evict"], default="mem",
-    )
-    ap.add_argument("--victim-defense", action="store_true")
+    ap.add_argument("--mode", choices=["mem", "busy", "target", "evict"], default="mem")
     args = ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    (OUT_DIR / f"meta_{stamp}.json").write_text(json.dumps({
-        "timestamp": datetime.now().isoformat(),
-        "levels": args.levels, "reps": args.reps,
-        "calib_runs": CALIB_RUNS, "warmup_s": WARMUP_S,
-        "load_meas_s": LOAD_MEAS_S, "mode": args.mode,
-        "loader_cpu": LOADER_CPU, "spy_cpu": SPY_CPU,
-        "victim_defense": args.victim_defense,
-    }, indent=2))
-    jsonl = OUT_DIR / "raw.jsonl"
-
     if args.experiment in ("exp1", "both"):
-        recs = run_experiment(
-            1, args.levels, args.reps, args.mode, args.victim_defense,
-        )
-        for r in recs:
-            append_jsonl(jsonl, {"exp": 1, **r})
+        recs = run_experiment(1, args.levels, args.reps, args.mode)
         stamped_path = OUT_DIR / f"{stamp}_exp1.csv"
         write_csv(stamped_path, recs, 1)
         write_csv(OUT_DIR / "exp1.csv", recs, 1)
         print(f"Wrote {stamped_path} and {OUT_DIR / 'exp1.csv'}")
 
     if args.experiment in ("exp2", "both"):
-        recs = run_experiment(
-            2, args.levels, args.reps, args.mode, args.victim_defense,
-        )
-        for r in recs:
-            append_jsonl(jsonl, {"exp": 2, **r})
+        recs = run_experiment(2, args.levels, args.reps, args.mode)
         stamped_path = OUT_DIR / f"{stamp}_exp2.csv"
         write_csv(stamped_path, recs, 2)
         write_csv(OUT_DIR / "exp2.csv", recs, 2)
